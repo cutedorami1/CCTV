@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EE IP CCTV Monitor & Signal Analyzer</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+  <style>
+    :root { color-scheme: dark; --panel:#151b26; --line:#293247; --accent:#53d6b6; }
+    * { box-sizing:border-box; }
+    body { margin:0; height:100vh; overflow:hidden; font-family:system-ui,"Malgun Gothic",sans-serif; background:#0b0f16; color:#e9eef7; }
+    header { height:64px; display:flex; align-items:center; gap:10px; padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--line); }
+    header strong { white-space:nowrap; margin-right:8px; }
+    input, select, button { min-height:38px; border:1px solid var(--line); border-radius:8px; color:#e9eef7; background:#0e1420; padding:0 12px; }
+    #source { min-width:260px; flex:1; }
+    button { cursor:pointer; background:#1d6f64; font-weight:700; }
+    button:hover { filter:brightness(1.15); }
+    main { height:calc(100vh - 148px); display:grid; grid-template-columns:minmax(0,1fr) 230px; gap:10px; padding:10px; }
+    .viewer { min-width:0; min-height:0; position:relative; display:grid; place-items:center; background:#000; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    #videoCanvas { width:100%; height:100%; object-fit:contain; }
+    #sourceVideo { display:none; }
+    .status { position:absolute; top:10px; left:10px; padding:6px 9px; border-radius:6px; background:#000a; font-size:12px; }
+    .graph { min-height:0; background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    #histCanvas { width:100%; height:100%; }
+    footer { height:84px; display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:16px; padding:9px 14px; background:var(--panel); border-top:1px solid var(--line); }
+    .control { display:grid; grid-template-columns:auto 1fr 42px; align-items:center; gap:8px; font-size:13px; }
+    input[type=range] { width:100%; padding:0; accent-color:var(--accent); }
+    .value { color:var(--accent); text-align:right; font-variant-numeric:tabular-nums; }
+    @media (max-width:760px) { body{overflow:auto;height:auto} header{height:auto;flex-wrap:wrap} main{height:65vh;grid-template-columns:1fr}.graph{display:none} footer{height:auto;grid-template-columns:1fr 1fr} }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>EE CCTV Monitor</strong>
+    <input id="source" value="0" aria-label="카메라 소스" placeholder="0 또는 브라우저 재생 가능 영상 URL">
+    <button id="connect">연결 / 재연결</button>
+    <select id="filter" aria-label="필터">
+      <option value="normal">Normal</option>
+      <option value="gray">Grayscale</option>
+      <option value="edge">Edge</option>
+      <option value="ai">AI Detection</option>
+    </select>
+  </header>
+
+  <main>
+    <section class="viewer">
+      <video id="sourceVideo" autoplay muted playsinline crossorigin="anonymous"></video>
+      <canvas id="videoCanvas"></canvas>
+      <div id="status" class="status">연결 대기 중</div>
+    </section>
+    <aside class="graph"><canvas id="histCanvas"></canvas></aside>
+  </main>
+
+  <footer>
+    <label class="control">Zoom <input id="zoom" type="range" min="1" max="3" step="0.01" value="1"><span id="zoomV" class="value">1.00×</span></label>
+    <label class="control">Pan <input id="pan" type="range" min="-100" max="100" value="0"><span id="panV" class="value">0</span></label>
+    <label class="control">Tilt <input id="tilt" type="range" min="-100" max="100" value="0"><span id="tiltV" class="value">0</span></label>
+    <label class="control">Mirror <input id="mirror" type="checkbox" checked><span class="value">좌우</span></label>
+  </footer>
+
+  <script>
+    const video = document.querySelector('#sourceVideo');
+    const canvas = document.querySelector('#videoCanvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently:true });
+    const hist = document.querySelector('#histCanvas');
+    const hctx = hist.getContext('2d');
+    const statusEl = document.querySelector('#status');
+    const controls = Object.fromEntries(['source','filter','zoom','pan','tilt','mirror'].map(id => [id, document.querySelector('#'+id)]));
+    let stream = null, model = null, boxes = [], detecting = false, lastDetect = 0;
+
+    function setStatus(text) { statusEl.textContent = text; }
+
+    async function connect() {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      video.pause(); video.removeAttribute('src'); video.srcObject = null;
+      const source = controls.source.value.trim();
+      try {
+        if (/^\d+$/.test(source)) {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const cams = devices.filter(d => d.kind === 'videoinput');
+          const index = Number(source);
+          const constraints = cams[index]?.deviceId
+            ? { video:{ deviceId:{ exact:cams[index].deviceId }, width:{ideal:1280}, height:{ideal:720} }, audio:false }
+            : { video:{ width:{ideal:1280}, height:{ideal:720} }, audio:false };
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          video.srcObject = stream;
+        } else {
+          if (/^rtsp:\/\//i.test(source)) throw new Error('브라우저는 RTSP를 직접 재생할 수 없습니다. HLS/WebRTC 주소로 변환하세요.');
+          video.src = source;
+        }
+        await video.play();
+        setStatus('연결됨');
+      } catch (err) { setStatus('연결 실패: ' + err.message); }
+    }
+
+    function fitCanvas() {
+      const box = canvas.getBoundingClientRect();
+      const dpr = Math.min(devicePixelRatio || 1, 2);
+      const w = Math.max(2, Math.floor(box.width*dpr));
+      const h = Math.max(2, Math.floor(box.height*dpr));
+      if (canvas.width !== w || canvas.height !== h) { canvas.width=w; canvas.height=h; }
+      const hb = hist.getBoundingClientRect();
+      if (hist.width !== Math.floor(hb.width*dpr) || hist.height !== Math.floor(hb.height*dpr)) {
+        hist.width=Math.max(2,Math.floor(hb.width*dpr)); hist.height=Math.max(2,Math.floor(hb.height*dpr));
+      }
+    }
+
+    function drawSource() {
+      const vw=video.videoWidth, vh=video.videoHeight, cw=canvas.width, ch=canvas.height;
+      if (!vw || !vh) return false;
+      const zoom=+controls.zoom.value, cropW=vw/zoom, cropH=vh/zoom;
+      const maxX=(vw-cropW)/2, maxY=(vh-cropH)/2;
+      const cx=vw/2 + (+controls.pan.value/100)*maxX;
+      const cy=vh/2 + (+controls.tilt.value/100)*maxY;
+      const sx=Math.max(0,Math.min(vw-cropW,cx-cropW/2));
+      const sy=Math.max(0,Math.min(vh-cropH,cy-cropH/2));
+      ctx.save(); ctx.clearRect(0,0,cw,ch);
+      if (controls.mirror.checked) { ctx.translate(cw,0); ctx.scale(-1,1); }
+      ctx.drawImage(video,sx,sy,cropW,cropH,0,0,cw,ch); ctx.restore();
+      return true;
+    }
+
+    function applyPixelFilter(mode) {
+      if (mode==='normal' || mode==='ai') return;
+      const img=ctx.getImageData(0,0,canvas.width,canvas.height), d=img.data;
+      const gray=new Uint8ClampedArray(canvas.width*canvas.height);
+      for(let i=0,j=0;i<d.length;i+=4,j++) gray[j]=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+      if(mode==='gray') for(let i=0,j=0;i<d.length;i+=4,j++) d[i]=d[i+1]=d[i+2]=gray[j];
+      else {
+        const w=canvas.width,h=canvas.height;
+        for(let y=1;y<h-1;y++) for(let x=1;x<w-1;x++) {
+          const p=y*w+x;
+          const gx=-gray[p-w-1]+gray[p-w+1]-2*gray[p-1]+2*gray[p+1]-gray[p+w-1]+gray[p+w+1];
+          const gy=-gray[p-w-1]-2*gray[p-w]-gray[p-w+1]+gray[p+w-1]+2*gray[p+w]+gray[p+w+1];
+          const v=Math.hypot(gx,gy)>150?255:0, i=p*4; d[i]=d[i+1]=d[i+2]=v;
+        }
+      }
+      ctx.putImageData(img,0,0);
+    }
+
+    function drawHistogram() {
+      const sample=ctx.getImageData(0,0,canvas.width,canvas.height).data, bins=new Uint32Array(256);
+      for(let i=0;i<sample.length;i+=16) bins[Math.round(.299*sample[i]+.587*sample[i+1]+.114*sample[i+2])]++;
+      const max=Math.max(...bins,1), w=hist.width,h=hist.height;
+      hctx.fillStyle='#080b10'; hctx.fillRect(0,0,w,h); hctx.strokeStyle='#53d6b6'; hctx.lineWidth=2; hctx.beginPath();
+      for(let i=0;i<256;i++){const x=i/255*w,y=h-28-(bins[i]/max)*(h-55); i?hctx.lineTo(x,y):hctx.moveTo(x,y)} hctx.stroke();
+      hctx.fillStyle='#eef'; hctx.font=`${Math.max(12,w/18)}px system-ui`; hctx.fillText('Brightness Histogram',12,22);
+      hctx.fillStyle='#8692a8'; hctx.fillText('0',8,h-8); hctx.fillText('255',w-34,h-8);
+    }
+
+    async function detect() {
+      if (!model || detecting) return;
+      detecting=true;
+      try { boxes=await model.detect(canvas,20,.45); } finally { detecting=false; }
+    }
+
+    function drawBoxes() {
+      ctx.lineWidth=Math.max(2,canvas.width/500); ctx.font=`${Math.max(14,canvas.width/55)}px system-ui`;
+      for(const b of boxes){ const [x,y,w,h]=b.bbox; ctx.strokeStyle='#31f2bd'; ctx.fillStyle='#31f2bd'; ctx.strokeRect(x,y,w,h); const t=`${b.class} ${Math.round(b.score*100)}%`; ctx.fillText(t,x+4,Math.max(20,y-6)); }
+    }
+
+    function loop(now=0) {
+      fitCanvas();
+      if(drawSource()) {
+        const mode=controls.filter.value; applyPixelFilter(mode);
+        if(mode==='ai') { if(now-lastDetect>250){lastDetect=now;detect()} drawBoxes(); }
+        drawHistogram();
+      }
+      requestAnimationFrame(loop);
+    }
+
+    document.querySelector('#connect').addEventListener('click',connect);
+    for(const id of ['zoom','pan','tilt']) controls[id].addEventListener('input',()=>document.querySelector('#'+id+'V').textContent=id==='zoom'?(+controls[id].value).toFixed(2)+'×':controls[id].value);
+    controls.filter.addEventListener('change', async () => {
+      boxes=[];
+      if(controls.filter.value==='ai' && !model){ setStatus('AI 모델 불러오는 중…'); try{model=await cocoSsd.load();setStatus('AI 모델 준비 완료')}catch(e){setStatus('AI 로드 실패: '+e.message)} }
+    });
+    window.addEventListener('beforeunload',()=>stream?.getTracks().forEach(t=>t.stop()));
+    connect(); loop();
+  </script>
+</body>
+</html>
